@@ -217,6 +217,7 @@ class RewardManager():
     def process(self, env, dt) -> float:
         # reset computation
         reward_buffer = 0.0
+        term_logs: dict[str, float] = {}
         # iterate over all the reward terms
         if self.reward_functions is not None:
             for name, term_cfg in self.reward_functions.items():
@@ -227,6 +228,7 @@ class RewardManager():
                 value = term_cfg.func(env, **term_cfg.params) * term_cfg.weight
                 # update total reward
                 reward_buffer += value
+                term_logs[name] = float(value)
 
         reward = reward_buffer + self.collected_signal_rewards
         self.collected_signal_rewards = 0.0
@@ -236,12 +238,277 @@ class RewardManager():
         log = env.logger[0]
         log['reward'] = f'{reward_buffer:.3f}'
         log['total_reward'] = f'{self.total_reward:.3f}'
+        if term_logs:
+            log['reward_terms'] = {k: f'{v:.3f}' for k, v in term_logs.items()}
+        signal_contrib = reward - reward_buffer
+        if abs(signal_contrib) > 0:
+            log['signal_reward'] = f'{signal_contrib:.3f}'
         env.logger[0] = log
         return reward
 
     def reset(self):
-        self.total_reward = 0
-        self.collected_signal_rewards
+        self.total_reward = 0.0
+        self.collected_signal_rewards = 0.0
+
+
+# ### Training Wrappers
+
+class ActionSubsetWrapper(gymnasium.ActionWrapper):
+    """
+    Mask out any buttons not listed in ``allowed_keys`` by zeroing their entries
+    in the action vector. This keeps the network interface identical while
+    effectively shrinking the usable action set.
+    """
+
+    def __init__(self, env, allowed_keys: list[str], threshold: float = 0.4):
+        super().__init__(env)
+        if not allowed_keys:
+            raise ValueError("ActionSubsetWrapper requires at least one allowed key.")
+
+        self.raw_env = getattr(env, "raw_env", getattr(env, "unwrapped", env))
+        self.act_helper = getattr(env, "act_helper", getattr(self.raw_env, "act_helper", None))
+
+        key_map = getattr(env, "act_helper", None)
+        if key_map is None:
+            raise AttributeError("Wrapped environment does not expose act_helper; cannot subset actions.")
+
+        self.key_indices: list[int] = []
+        self.threshold = threshold
+        for key in allowed_keys:
+            key = key.lower()
+            if key not in key_map.sections:
+                raise KeyError(f"Key '{key}' not present in action space. Available keys: {list(key_map.sections.keys())}")
+            self.key_indices.append(key_map.sections[key])
+
+    def action(self, action):
+        action = np.asarray(action, dtype=np.float32).copy()
+        filtered = np.zeros_like(action)
+        filtered[self.key_indices] = action[self.key_indices]
+        return (filtered >= self.threshold).astype(np.int32)
+
+
+class BinaryActionWrapper(gymnasium.ActionWrapper):
+    """
+    Convert continuous action vectors into binary button presses by thresholding.
+    """
+
+    def __init__(self, env, threshold: float = 0.4):
+        super().__init__(env)
+        self.threshold = threshold
+
+    def action(self, action):
+        action = np.asarray(action, dtype=np.float32).copy()
+        return (action >= self.threshold).astype(np.int32)
+
+def _resolve_allowed_action_indices(act_helper: ActHelper | None, allowed_keys: list[str]) -> Optional[list[int]]:
+    if act_helper is None:
+        return None
+    indices = []
+    for key in allowed_keys:
+        key = key.lower()
+        if key not in act_helper.sections:
+            raise KeyError(f"Key '{key}' not present in action space. Available keys: {list(act_helper.sections.keys())}")
+        indices.append(act_helper.sections[key])
+    return indices
+
+
+def _filter_action_vector(action: np.ndarray, allowed_indices: list[int], threshold: float = 0.4) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32).copy()
+    filtered = np.zeros_like(action)
+    filtered[allowed_indices] = action[allowed_indices]
+    return (filtered >= threshold).astype(np.int32)
+
+
+class Stage1InitializationWrapper(gymnasium.Wrapper):
+    """
+    Episode wrapper used for the first curriculum phase. It randomizes starting
+    health values and spawn locations to avoid overfitting to the default reset.
+    """
+
+    def __init__(
+        self,
+        env,
+        player_damage_range: tuple[float, float] = (0.0, 80.0),
+        opponent_damage_range: tuple[float, float] = (0.0, 80.0),
+        spawn_range: tuple[float, float] = (-5.0, 5.0),
+    ):
+        super().__init__(env)
+        self.raw_env = getattr(env, "raw_env", getattr(env, "unwrapped", env))
+        self.player_damage_range = player_damage_range
+        self.opponent_damage_range = opponent_damage_range
+        self.spawn_range = spawn_range
+        # Expose base environment attributes so downstream wrappers can still access them.
+        self.act_helper = getattr(env, "act_helper", None)
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._randomize_health_and_positions()
+        return self._refresh_observation(obs), info
+
+    def _refresh_observation(self, original_obs):
+        raw_env = getattr(self, "raw_env", None)
+        if raw_env is None:
+            return original_obs
+
+        if hasattr(self.env, "opponent_obs"):
+            self.env.opponent_obs = raw_env.observe(1)
+        return raw_env.observe(0)
+
+    def _randomize_health_and_positions(self):
+        raw_env = getattr(self, "raw_env", None)
+        if raw_env is None:
+            return
+
+        player = raw_env.objects.get("player")
+        opponent = raw_env.objects.get("opponent")
+        if player is None or opponent is None:
+            return
+
+        self._set_damage(player, random.uniform(*self.player_damage_range))
+        self._set_damage(opponent, random.uniform(*self.opponent_damage_range))
+
+        # Randomize horizontal spawn positions with a minimum separation.
+        min_sep = 1.5
+        left, right = self.spawn_range
+        for _ in range(10):
+            p1_x = random.uniform(left, right)
+            p2_x = random.uniform(left, right)
+            if abs(p1_x - p2_x) >= min_sep:
+                break
+        else:
+            p1_x, p2_x = -2.5, 2.5
+
+        self._set_position(player, (p1_x, 0.0))
+        self._set_position(opponent, (p2_x, 0.0))
+        setattr(raw_env, "_stage1_prev_distance", abs(player.body.position.x - opponent.body.position.x))
+
+    @staticmethod
+    def _set_damage(player, value: float):
+        value = max(0.0, float(value))
+        player.damage = value
+        player.damage_taken_this_stock = value
+        player.damage_taken_total = value
+
+    @staticmethod
+    def _set_position(player, pos: tuple[float, float]):
+        x, y = pos
+        player.body.position = pymunk.Vec2d(x, y)
+        player.body.velocity = pymunk.Vec2d(0.0, 0.0)
+        player.prev_x = x
+        player.prev_y = y
+        player.start_position = [x, y]
+
+
+class ObservationNormalizationWrapper(gymnasium.ObservationWrapper):
+    """
+    Linearly scale each observation component into roughly [-1, 1] using known
+    physical limits, without modifying the underlying environment.
+    """
+
+    POS_LIMIT = np.array([18.0, 7.0], dtype=np.float32)
+    VEL_LIMIT = np.array([10.0, 10.0], dtype=np.float32)
+    SPAWNER_TYPE_LIMIT = 3.0
+    JUMPS_LIMIT = 2.0
+    STATE_LIMIT = 12.0
+    MOVE_TYPE_LIMIT = 11.0
+    STOCK_LIMIT = 3.0
+    WEAPON_TYPE_LIMIT = 3.0
+    DODGE_LIMIT = 82.0
+    STUN_LIMIT = 80.0
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.raw_env = getattr(env, "raw_env", getattr(env, "unwrapped", env))
+        self.act_helper = getattr(env, "act_helper", getattr(self.raw_env, "act_helper", None))
+        self.obs_helper = getattr(env, "obs_helper", getattr(self.raw_env, "obs_helper", None))
+        if self.obs_helper is None:
+            raise AttributeError("ObservationNormalizationWrapper requires an environment exposing obs_helper.")
+
+        self.section_slices: dict[str, tuple[int, int]] = self.obs_helper.sections
+        self.section_affine: dict[str, tuple[np.ndarray, np.ndarray]] = {
+            name: self._compute_affine(name, start, end)
+            for name, (start, end) in self.section_slices.items()
+        }
+
+        self.observation_space = env.observation_space
+
+    def observation(self, observation):
+        obs = np.array(observation, dtype=np.float32, copy=True)
+        for name, (start, end) in self.section_slices.items():
+            scale, offset = self.section_affine[name]
+            if scale.size == 0:
+                continue
+            obs_section = obs[start:end]
+            obs[start:end] = np.clip(obs_section * scale + offset, -1.0, 1.0)
+        return obs
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self.observation(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self.observation(obs), reward, terminated, truncated, info
+
+    def _compute_affine(self, name: str, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+        length = end - start
+        if length == 0:
+            return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+        def _ensure_shape(arr: np.ndarray | float, size: int) -> np.ndarray:
+            arr_np = np.asarray(arr, dtype=np.float32)
+            if arr_np.shape == ():
+                arr_np = np.full(size, float(arr_np), dtype=np.float32)
+            return np.broadcast_to(arr_np, (size,)).astype(np.float32)
+
+        if "_pos" in name and "spawner" not in name:
+            low = -self.POS_LIMIT
+            high = self.POS_LIMIT
+        elif "_vel" in name and "spawner" not in name:
+            low = -self.VEL_LIMIT
+            high = self.VEL_LIMIT
+        elif "_facing" in name or "_grounded" in name or "_aerial" in name or "_damage" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.ones(length, dtype=np.float32)
+        elif "_jumps_left" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.JUMPS_LIMIT, dtype=np.float32)
+        elif "_state" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.STATE_LIMIT, dtype=np.float32)
+        elif "_move_type" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.MOVE_TYPE_LIMIT, dtype=np.float32)
+        elif "_stocks" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.STOCK_LIMIT, dtype=np.float32)
+        elif "_recoveries_left" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.ones(length, dtype=np.float32)
+        elif "_dodge_timer" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.DODGE_LIMIT, dtype=np.float32)
+        elif "_stun_frames" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.STUN_LIMIT, dtype=np.float32)
+        elif "_weapon_type" in name:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.full(length, self.WEAPON_TYPE_LIMIT, dtype=np.float32)
+        elif "_spawner_" in name:
+            low = np.array([-self.POS_LIMIT[0], -self.POS_LIMIT[1], 0.0], dtype=np.float32)
+            high = np.array([self.POS_LIMIT[0], self.POS_LIMIT[1], self.SPAWNER_TYPE_LIMIT], dtype=np.float32)
+        else:
+            low = np.zeros(length, dtype=np.float32)
+            high = np.ones(length, dtype=np.float32)
+
+        low = _ensure_shape(low, length)
+        high = _ensure_shape(high, length)
+        denom = np.maximum(high - low, 1e-6)
+        scale = 2.0 / denom
+        offset = -(high + low) / denom
+        return scale, offset
 
 
 # ### Save, Self-play, and Opponents
@@ -593,18 +860,39 @@ def run_match(agent_1: Agent | partial,
               agent_2_name: Optional[str]=None,
               resolution = CameraResolution.LOW,
               reward_manager: Optional[RewardManager]=None,
-              train_mode=False
+              train_mode=False,
+              allowed_keys: Optional[List[str]] = None,
+              env_wrappers: Optional[List[Callable[[gymnasium.Env], gymnasium.Env]]] = None,
               ) -> MatchStats:
     # Initialize env
 
     env = WarehouseBrawl(resolution=resolution, train_mode=train_mode)
+
+    allowed_indices: Optional[List[int]] = None
+
+    if env_wrappers and isinstance(env, gymnasium.Env):
+        for wrapper_fn in env_wrappers:
+            env = wrapper_fn(env)
+    elif env_wrappers:
+        warnings.warn("env_wrappers ignored: WarehouseBrawl is not a gymnasium.Env instance.")
+
+    if allowed_keys is not None:
+        if isinstance(env, gymnasium.Env):
+            env = ActionSubsetWrapper(env, allowed_keys=allowed_keys)
+        else:
+            allowed_indices = _resolve_allowed_action_indices(getattr(env, "act_helper", None), allowed_keys)
+
     observations, infos = env.reset()
     obs_1 = observations[0]
     obs_2 = observations[1]
     print("RUN MATCH IS RUNNING")
+
     if reward_manager is not None:
         reward_manager.reset()
-        reward_manager.subscribe_signals(env)
+        base_raw_env = getattr(env, "raw_env", None)
+        if base_raw_env is None and hasattr(env, "env"):
+            base_raw_env = env.unwrapped if hasattr(env, "unwrapped") else env
+        reward_manager.subscribe_signals(base_raw_env or env)
 
     if agent_1_name is None:
         agent_1_name = 'agent_1'
@@ -626,7 +914,8 @@ def run_match(agent_1: Agent | partial,
             '-pix_fmt': 'yuv420p',  # Compatible with both WMP & Colab
             '-preset': 'fast',  # Faster encoding
             '-crf': '20',  # Quality-based encoding (lower = better quality)
-            '-r': '30'  # Frame rate
+            '-r': '30',  # Frame rate
+            '-vf': 'transpose=1,hflip'
         })
 
     # If partial
@@ -647,6 +936,12 @@ def run_match(agent_1: Agent | partial,
           0: agent_1.predict(obs_1),
           1: agent_2.predict(obs_2)
       }
+
+      if allowed_indices is not None:
+          full_action = {
+              agent_id: _filter_action_vector(act, allowed_indices)
+              for agent_id, act in full_action.items()
+          }
 
       observations, rewards, terminated, truncated, info = env.step(full_action)
       obs_1 = observations[0]
@@ -1002,15 +1297,29 @@ def train(agent: Agent,
           opponent_cfg: OpponentsCfg=OpponentsCfg(),
           resolution: CameraResolution=CameraResolution.LOW,
           train_timesteps: int=400_000,
-          train_logging: TrainLogging=TrainLogging.PLOT
+          train_logging: TrainLogging=TrainLogging.PLOT,
+          allowed_keys: Optional[List[str]] = None,
+          env_wrappers: Optional[List[Callable[[gymnasium.Env], gymnasium.Env]]] = None,
           ):
     # Create environment
-    env = SelfPlayWarehouseBrawl(reward_manager=reward_manager,
-                                 opponent_cfg=opponent_cfg,
-                                 save_handler=save_handler,
-                                 resolution=resolution
-                                 )
-    reward_manager.subscribe_signals(env.raw_env)
+    env = SelfPlayWarehouseBrawl(
+        reward_manager=reward_manager,
+        opponent_cfg=opponent_cfg,
+        save_handler=save_handler,
+        resolution=resolution
+    )
+    if env_wrappers:
+        for wrapper_fn in env_wrappers:
+            env = wrapper_fn(env)
+
+    if allowed_keys is not None:
+        env = ActionSubsetWrapper(env, allowed_keys=allowed_keys)
+
+    base_raw_env = getattr(env, "raw_env", None)
+    if base_raw_env is None and hasattr(env, "env"):
+        base_raw_env = env.unwrapped if hasattr(env, "unwrapped") else env
+    reward_manager.subscribe_signals(base_raw_env)
+
     if train_logging != TrainLogging.NONE:
         # Create log dir
         log_dir = f"{save_handler._experiment_path()}/" if save_handler is not None else "/tmp/gym/"
@@ -1040,7 +1349,14 @@ def train(agent: Agent,
 import pygame
 from pygame.locals import QUIT
 
-def run_real_time_match(agent_1: UserInputAgent, agent_2: Agent, max_timesteps=30*90, resolution=CameraResolution.LOW):
+def run_real_time_match(
+    agent_1: UserInputAgent,
+    agent_2: Agent,
+    max_timesteps=30*90,
+    resolution=CameraResolution.LOW,
+    allowed_keys: Optional[List[str]] = None,
+    env_wrappers: Optional[List[Callable[[gymnasium.Env], gymnasium.Env]]] = None,
+):
     pygame.init()
 
     pygame.mixer.init()
@@ -1069,6 +1385,21 @@ def run_real_time_match(agent_1: UserInputAgent, agent_2: Agent, max_timesteps=3
 
     # Initialize environment
     env = WarehouseBrawl(resolution=resolution, train_mode=False)
+
+    allowed_indices: Optional[List[int]] = None
+
+    if env_wrappers and isinstance(env, gymnasium.Env):
+        for wrapper_fn in env_wrappers:
+            env = wrapper_fn(env)
+    elif env_wrappers:
+        warnings.warn("env_wrappers ignored: WarehouseBrawl is not a gymnasium.Env instance.")
+
+    if allowed_keys is not None:
+        if isinstance(env, gymnasium.Env):
+            env = ActionSubsetWrapper(env, allowed_keys=allowed_keys)
+        else:
+            allowed_indices = _resolve_allowed_action_indices(getattr(env, "act_helper", None), allowed_keys)
+
     observations, _ = env.reset()
     obs_1 = observations[0]
     obs_2 = observations[1]
@@ -1099,6 +1430,13 @@ def run_real_time_match(agent_1: UserInputAgent, agent_2: Agent, max_timesteps=3
 
         # Sample action space
         full_action = {0: action_1, 1: action_2}
+
+        if allowed_indices is not None:
+            full_action = {
+                agent_id: _filter_action_vector(act, allowed_indices)
+                for agent_id, act in full_action.items()
+            }
+
         observations, rewards, terminated, truncated, info = env.step(full_action)
         obs_1 = observations[0]
         obs_2 = observations[1]

@@ -19,6 +19,7 @@ from torch.nn import functional as F
 from torch import nn as nn
 import numpy as np
 import pygame
+import math
 from stable_baselines3 import A2C, PPO, SAC, DQN, DDPG, TD3, HER 
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.base_class import BaseAlgorithm
@@ -279,26 +280,34 @@ class MLPPolicy(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
+
 class MLPExtractor(BaseFeaturesExtractor):
-    '''
-    Class that defines an MLP Base Features Extractor
-    '''
-    def __init__(self, observation_space: gym.Space, features_dim: int = 64, hidden_dim: int = 64):
-        super(MLPExtractor, self).__init__(observation_space, features_dim)
-        self.model = MLPPolicy(
-            obs_dim=observation_space.shape[0], 
-            action_dim=10,
-            hidden_dim=hidden_dim,
+    def __init__(self, observation_space: gym.Space, features_dim: int = 128, hidden_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        in_dim = int(np.prod(observation_space.shape))
+        self.model = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, features_dim),
         )
-    
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                gain = 0.01 if m is self.model[-1] else 2**0.5
+                nn.init.orthogonal_(m.weight, gain=gain); nn.init.constant_(m.bias, 0.)
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        if obs.dim() > 2:
+            obs = obs.view(obs.size(0), -1)
         return self.model(obs)
-    
+
     @classmethod
-    def get_policy_kwargs(cls, features_dim: int = 64, hidden_dim: int = 64) -> dict:
+    def get_policy_kwargs(cls, features_dim: int = 128, hidden_dim: int = 256) -> dict:
         return dict(
             features_extractor_class=cls,
-            features_extractor_kwargs=dict(features_dim=features_dim, hidden_dim=hidden_dim) #NOTE: features_dim = 10 to match action space output
+            features_extractor_kwargs=dict(features_dim=features_dim, hidden_dim=hidden_dim),
+            net_arch=[dict(pi=[256, 256], vf=[256, 256])],
+            activation_fn=nn.SiLU,
+            ortho_init=True,
         )
     
 class CustomAgent(Agent):
@@ -308,8 +317,19 @@ class CustomAgent(Agent):
         super().__init__(file_path)
     
     def _initialize(self) -> None:
+        if self.extractor is None:
+            raise ValueError("CustomAgent requires an extractor; pass extractor=MLPExtractor (or similar).")
+
         if self.file_path is None:
-            self.model = self.sb3_class("MlpPolicy", self.env, policy_kwargs=self.extractor.get_policy_kwargs(), verbose=0, n_steps=30*90*3, batch_size=128, ent_coef=0.01)
+            self.model = self.sb3_class(
+                "MlpPolicy",
+                self.env,
+                policy_kwargs=self.extractor.get_policy_kwargs(),
+                verbose=0,
+                n_steps=30 * 90 * 3,
+                batch_size=128,
+                ent_coef=0.01,
+            )
             del self.env
         else:
             self.model = self.sb3_class.load(self.file_path)
@@ -456,6 +476,331 @@ def in_state_reward(
 
     return reward * env.dt
 
+
+def stage1_health_distance_reward(
+    env: WarehouseBrawl,
+    close_target: float = 2.5,
+    far_target: float = 6.0,
+    sigma: float = 1.6
+) -> float:
+    """
+    Encourage the agent to approach when healthier and disengage when behind.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+
+    horizontal_distance = abs(player.body.position.x - opponent.body.position.x)
+    health_margin = opponent.damage - player.damage  # positive → player healthier
+    sigma = max(1e-3, sigma)
+
+    if health_margin >= 0:
+        weight = min(health_margin / 120.0, 1.0)
+        score = math.exp(-((horizontal_distance - close_target) ** 2) / (2 * sigma ** 2))
+        return weight * score * env.dt
+    else:
+        weight = min((-health_margin) / 120.0, 1.0)
+        spread = sigma * 1.5
+        score = math.exp(-((horizontal_distance - far_target) ** 2) / (2 * spread ** 2))
+        return weight * score * env.dt
+
+
+def stage1_ground_contact_reward(
+    env: WarehouseBrawl,
+    danger_threshold: float = 3.8
+) -> float:
+    """
+    Reward staying within safe vertical bounds and lightly favour grounded states.
+    """
+    player: Player = env.objects["player"]
+    grounded = player.is_on_floor() or player.on_platform is not None
+
+    if player.body.position.y > danger_threshold:
+        return -0.25 * env.dt
+    return (0.12 if grounded else 0.0) * env.dt
+
+
+def stage1_horizontal_velocity_reward(
+    env: WarehouseBrawl,
+    scale: float = 0.2
+) -> float:
+    """
+    Provide a small incentive for horizontal movement to combat idling.
+    """
+    player: Player = env.objects["player"]
+    velocity = abs(player.body.velocity.x)
+    return min(velocity, 6.0) * scale * env.dt
+
+
+def _stage1_get_jump_tracker(env: WarehouseBrawl) -> dict:
+    tracker = getattr(env, "_stage1_jump_tracker", None)
+    if tracker is None:
+        tracker = {
+            "tracking_jump": False,
+            "pre_jump_height_diff": None,
+            "frames_since_jump": 0,
+            "penalty_cooldown": 0,
+            "intent_reward_granted": False,
+        }
+        env._stage1_jump_tracker = tracker
+    return tracker
+
+
+def stage1_proximity_delta_reward(
+    env: WarehouseBrawl,
+    approach_scale: float = 1.5,
+    hold_bonus: float = 0.1,
+    preferred_distance: float = 2.2
+) -> float:
+    """
+    Reward the agent for shrinking the horizontal gap to the opponent and for
+    staying within a preferred melee range once achieved.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+
+    current_distance = abs(player.body.position.x - opponent.body.position.x)
+    previous_distance = getattr(env, "_stage1_prev_distance", current_distance)
+    env._stage1_prev_distance = current_distance
+
+    if previous_distance is None:
+        return 0.0
+
+    distance_delta = previous_distance - current_distance
+    reward = distance_delta * approach_scale
+    if current_distance <= preferred_distance:
+        reward += hold_bonus
+
+    return reward * env.dt
+
+
+def stage1_distance_potential_reward(
+    env: WarehouseBrawl,
+    max_distance: float = 10.0
+) -> float:
+    """
+    Dense potential-based reward that encourages staying close to the opponent.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+
+    distance = abs(player.body.position.x - opponent.body.position.x)
+    closeness = 1.0 - min(max(distance / max_distance, 0.0), 1.0)
+    return closeness * env.dt
+
+
+def stage1_distance_penalty_reward(
+    env: WarehouseBrawl,
+    min_distance: float = 0.2,
+    max_distance: float = 10.0
+) -> float:
+    """
+    Apply a penalty proportional to the current distance from the opponent.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    distance = abs(player.body.position.x - opponent.body.position.x)
+    distance_clamped = min(max(distance, min_distance), max_distance)
+    return -distance_clamped * env.dt
+
+
+def stage1_directional_velocity_reward(
+    env: WarehouseBrawl,
+    max_speed: float = 6.0,
+    deadzone: float = 0.4
+) -> float:
+    """
+    Encourage moving horizontally toward the opponent when far away.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    dx = opponent.body.position.x - player.body.position.x
+    if abs(dx) <= deadzone:
+        return 0.0
+
+    desired_dir = np.sign(dx)
+    normalized_speed = np.clip(player.body.velocity.x / max_speed, -1.0, 1.0)
+    return desired_dir * normalized_speed * env.dt
+
+
+def stage1_vertical_alignment_reward(
+    env: WarehouseBrawl,
+    max_height_diff: float = 4.0,
+    hold_bonus: float = 0.2
+) -> float:
+    """
+    Encourage matching the opponent's vertical position.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    height_diff = abs(player.body.position.y - opponent.body.position.y)
+    normalized = 1.0 - min(height_diff / max_height_diff, 1.0)
+    reward = normalized * env.dt
+    if height_diff <= 0.5:
+        reward += hold_bonus * env.dt
+    return reward
+
+
+def stage1_stagnation_penalty_reward(
+    env: WarehouseBrawl,
+    min_speed: float = 0.15
+) -> float:
+    """
+    Penalize pressing horizontal controls without producing movement.
+    """
+    player: Player = env.objects["player"]
+    action_vec = player.cur_action
+    act_helper = env.act_helper
+    if action_vec is None or act_helper is None:
+        return 0.0
+
+    horizontal_keys = []
+    for key in ('a', 'd'):
+        idx = act_helper.sections.get(key)
+        if idx is not None:
+            horizontal_keys.append(idx)
+
+    if not horizontal_keys:
+        return 0.0
+
+    if any(action_vec[idx] > 0.5 for idx in horizontal_keys):
+        if abs(player.body.velocity.x) < min_speed:
+            return -1.0 * env.dt
+    return 0.0
+
+
+def stage1_jump_penalty_reward(
+    env: WarehouseBrawl,
+    min_horizontal_speed: float = 1.0,
+    close_distance: float = 1.2,
+    vertical_tolerance: float = 0.25,
+    penalty_value: float = -0.4,
+    cooldown_frames: int = 8
+) -> float:
+    """
+    Penalize clearly wasteful jumps (e.g., neutral hops while grounded and not
+    attempting to close a vertical gap), while leaving room for tactical jumps.
+    """
+    player: Player = env.objects["player"]
+    action_vec = player.cur_action
+    if action_vec is None or len(action_vec) == 0:
+        return 0.0
+
+    act_helper = env.act_helper
+    if act_helper is None or 'space' not in act_helper.sections:
+        return 0.0
+
+    space_idx = act_helper.sections['space']
+    if action_vec[space_idx] > 0.5:
+        grounded = player.is_on_floor() or player.on_platform is not None
+        opponent: Player = env.objects["opponent"]
+        player_below = player.body.position.y > opponent.body.position.y + vertical_tolerance
+        horizontal_gap = abs(player.body.position.x - opponent.body.position.x)
+        horizontal_speed = abs(player.body.velocity.x)
+
+        tracker = _stage1_get_jump_tracker(env)
+        tracker["intent_reward_granted"] = tracker["intent_reward_granted"] and grounded
+        if tracker["penalty_cooldown"] > 0:
+            tracker["penalty_cooldown"] -= 1
+            return 0.0
+
+        if grounded and not player_below and horizontal_gap > close_distance and horizontal_speed < min_horizontal_speed:
+            tracker["penalty_cooldown"] = cooldown_frames
+            return penalty_value * env.dt
+    return 0.0
+
+
+def stage1_jump_alignment_reward(
+    env: WarehouseBrawl,
+    min_improvement: float = 0.15,
+    jump_window: int = 18,
+    improvement_scale: float = 2.0,
+) -> float:
+    """
+    Provide a positive signal when a jump meaningfully reduces the vertical gap
+    to the opponent soon after takeoff.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    action_vec = player.cur_action
+    act_helper = env.act_helper
+
+    if action_vec is None or act_helper is None:
+        return 0.0
+
+    tracker = _stage1_get_jump_tracker(env)
+    space_idx = act_helper.sections.get('space')
+    if space_idx is None:
+        return 0.0
+
+    grounded = player.is_on_floor() or player.on_platform is not None
+    height_diff = abs(player.body.position.y - opponent.body.position.y)
+
+    if action_vec[space_idx] > 0.5 and grounded:
+        tracker["tracking_jump"] = True
+        tracker["pre_jump_height_diff"] = height_diff
+        tracker["frames_since_jump"] = 0
+        return 0.0
+
+    if not tracker["tracking_jump"]:
+        return 0.0
+
+    tracker["frames_since_jump"] += 1
+    previous_diff = tracker.get("pre_jump_height_diff")
+    if previous_diff is None:
+        tracker["tracking_jump"] = False
+        return 0.0
+
+    improvement = previous_diff - height_diff
+    reward = 0.0
+
+    if improvement >= min_improvement:
+        reward = improvement * improvement_scale * env.dt
+        tracker["tracking_jump"] = False
+        tracker["pre_jump_height_diff"] = None
+    elif tracker["frames_since_jump"] > jump_window:
+        tracker["tracking_jump"] = False
+        tracker["pre_jump_height_diff"] = None
+
+    return reward
+
+
+def stage1_jump_initiation_reward(
+    env: WarehouseBrawl,
+    vertical_tolerance: float = 0.35,
+    reward_value: float = 0.6
+) -> float:
+    """
+    Reward pressing jump while grounded when the opponent is clearly above.
+    """
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    action_vec = player.cur_action
+    act_helper = env.act_helper
+
+    if action_vec is None or act_helper is None:
+        return 0.0
+
+    space_idx = act_helper.sections.get('space')
+    if space_idx is None:
+        return 0.0
+
+    tracker = _stage1_get_jump_tracker(env)
+    grounded = player.is_on_floor() or player.on_platform is not None
+    player_below = player.body.position.y > opponent.body.position.y + vertical_tolerance
+
+    if action_vec[space_idx] > 0.5 and grounded and player_below:
+        if not tracker["intent_reward_granted"]:
+            tracker["intent_reward_granted"] = True
+            return reward_value * env.dt
+    elif grounded:
+        tracker["intent_reward_granted"] = False
+
+    if not grounded:
+        tracker["intent_reward_granted"] = False
+
+    return 0.0
+
+
 def head_to_middle_reward(
     env: WarehouseBrawl,
 ) -> float:
@@ -538,6 +883,31 @@ def on_combo_reward(env: WarehouseBrawl, agent: str) -> float:
     else:
         return 1.0
 
+
+STAGE1_ALLOWED_KEYS = ["a", "d", "space"]
+
+def gen_stage1_reward_manager() -> RewardManager:
+    reward_functions = {
+        'stage1_distance_potential_reward': RewTerm(func=stage1_distance_potential_reward, weight=6.0),
+        'stage1_distance_penalty_reward': RewTerm(func=stage1_distance_penalty_reward, weight=1.0),
+        'stage1_proximity_delta_reward': RewTerm(func=stage1_proximity_delta_reward, weight=0.5),
+        'stage1_directional_velocity_reward': RewTerm(func=stage1_directional_velocity_reward, weight=1.2),
+        'stage1_horizontal_velocity_reward': RewTerm(func=stage1_horizontal_velocity_reward, weight=0.6),
+        'stage1_ground_contact_reward': RewTerm(func=stage1_ground_contact_reward, weight=0.25),
+        'stage1_health_distance_reward': RewTerm(func=stage1_health_distance_reward, weight=0.6),
+        'stage1_vertical_alignment_reward': RewTerm(func=stage1_vertical_alignment_reward, weight=1.0),
+        'stage1_stagnation_penalty_reward': RewTerm(func=stage1_stagnation_penalty_reward, weight=0.6),
+        'stage1_jump_initiation_reward': RewTerm(func=stage1_jump_initiation_reward, weight=1.2),
+        'stage1_jump_alignment_reward': RewTerm(func=stage1_jump_alignment_reward, weight=0.8),
+        'stage1_jump_penalty_reward': RewTerm(func=stage1_jump_penalty_reward, weight=0.3),
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
+        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=0.3),
+    }
+    signal_subscriptions = {
+        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=25)),
+    }
+    return RewardManager(reward_functions, signal_subscriptions)
+
 '''
 Add your dictionary of RewardFunctions here using RewTerms
 '''
@@ -572,42 +942,41 @@ if __name__ == '__main__':
     my_agent = CustomAgent(sb3_class=PPO, extractor=MLPExtractor)
 
     # Start here if you want to train from scratch. e.g:
-    my_agent = RecurrentPPOAgent()
+    # my_agent = RecurrentPPOAgent()
 
     # Start here if you want to train from a specific timestep. e.g:
     #my_agent = RecurrentPPOAgent(file_path='checkpoints/experiment_3/rl_model_120006_steps.zip')
 
     # Reward manager
-    reward_manager = gen_reward_manager()
-    # Self-play settings
-    selfplay_handler = SelfPlayRandom(
-        partial(type(my_agent)), # Agent class and its keyword arguments
-                                 # type(my_agent) = Agent class
-    )
-
+    reward_manager = gen_stage1_reward_manager()
     # Set save settings here:
     save_handler = SaveHandler(
         agent=my_agent, # Agent to save
         save_freq=100_000, # Save frequency
         max_saved=40, # Maximum number of saved models
         save_path='checkpoints', # Save path
-        run_name='experiment_9',
+        run_name='stage1_experiment',
         mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
     )
 
     # Set opponent settings here:
     opponent_specification = {
-                    'self_play': (8, selfplay_handler),
-                    'constant_agent': (0.5, partial(ConstantAgent)),
-                    'based_agent': (1.5, partial(BasedAgent)),
+                    'constant_agent': (1.0, partial(ConstantAgent)),
                 }
     opponent_cfg = OpponentsCfg(opponents=opponent_specification)
+
+    stage1_wrappers = [
+        lambda env: Stage1InitializationWrapper(env),
+        lambda env: ObservationNormalizationWrapper(env),
+    ]
 
     train(my_agent,
         reward_manager,
         save_handler,
         opponent_cfg,
         CameraResolution.LOW,
-        train_timesteps=1_000_000_000,
-        train_logging=TrainLogging.PLOT
+        train_timesteps=400_000,
+        train_logging=TrainLogging.PLOT,
+        allowed_keys=STAGE1_ALLOWED_KEYS,
+        env_wrappers=stage1_wrappers
     )
